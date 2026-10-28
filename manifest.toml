@@ -1,0 +1,394 @@
+# vyges formal campaign: FFT accelerator as integrated in the Edge Sensor SoC (1024-point build).
+# Design under proof = RTL only (formal runs early in the cycle; no taped-out material is an input).
+
+[ip]
+name = "fft-edge-sensor"
+description = "FFT accelerator (fast-fourier-transform-ip) as integrated in the Edge Sensor SoC: TL-UL -> APB bridge, 1024-point, 16-bit fixed point, two 1024x32 SRAM banks outside the block."
+scope_notes = """
+Configuration: FFT_MAX_LENGTH_LOG2 = 10 (1024-point; the IP itself goes to 4096), data and twiddle
+width 16, TL-UL bus bridged to the IP's APB port, AXI port tied off. SRAM bank 0 holds data, bank 1
+twiddles. SRAM read data is unconstrained (no memory model): every claim here is a control, address
+or protocol claim that must hold for any data. End-to-end numerical correctness of a transform is
+NOT claimed.
+"""
+
+[rtl]
+repo = "../vyges-edge-sensor-soc"   # clone it beside this repository, at the commit in report/
+files = ["verilog/rtl/soc_conv.v"]
+extract_top = true
+top = "fft_ctrl_tlul"
+clock = "clk_i"
+params = { FFT_MAX_LENGTH_LOG2 = 10, FFT_DATA_WIDTH = 16, FFT_TWIDDLE_WIDTH = 16 }
+
+[synth]
+# override with --liberty or VYGES_FORMAL_LIBERTY
+liberty = "${PDK_ROOT}/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+
+[defaults]
+timeout_s = 1800
+
+[[bind]]
+module = "fft_engine"
+file = "monitors/mon_engine.v"
+clock = "clk_i"
+reset = "reset_n_i"
+
+[[bind]]
+module = "memory_interface"
+file = "monitors/mon_memif.v"
+clock = "clk_i"
+reset = "reset_n_i"
+
+[[bind]]
+module = "fft_control"
+file = "monitors/mon_control.v"
+clock = "clk_i"
+reset = "reset_n_i"
+
+[[bind]]
+module = "tlul_apb_adapter"
+file = "monitors/mon_adapter.v"
+clock = "clk_i"
+reset = "rst_ni"
+
+[[assumption]]
+id = "start_once"
+text = "Software may hold START high from launch, but once START is low during a run it is not raised again until the engine is idle."
+
+[[assumption]]
+id = "no_abort"
+text = "A run is never aborted: software does not write CTRL.reset, and the block reset is not asserted again once the block has come out of reset."
+
+[[assumption]]
+id = "legal_len"
+text = "Whenever START is high, the programmed length is legal for this build: log2(N) in 8..10 (256..1024 points)."
+
+# ---------------------------------------------------------------- C1 reset
+[[property]]
+id = "c1_engine_reset_state"
+claim = "C1"
+text = "On the first cycle after reset, the engine is idle with counters, write strobe and scale factor clear."
+
+[[property]]
+id = "c1_regs_reset_values"
+claim = "C1"
+text = "On the first cycle after reset, CTRL, CONFIG and INT_ENABLE are 0, LENGTH is 0x400, and PREADY is low."
+
+[[property]]
+id = "c1_int_status_reset"
+claim = "C1"
+text = "On the first cycle after reset, interrupt status is clear."
+
+[[property]]
+id = "c1_adapter_reset"
+claim = "C1"
+text = "On the first cycle after reset, the bus bridge accepts requests, has no response pending and no APB transfer open."
+
+# ---------------------------------------------------------------- C2 done
+[[property]]
+id = "c2_done_after_last_stage_raw"
+claim = "C2"
+text = "DONE is reported only after every stage of the programmed length has run (no software assumption)."
+expect = "fails"
+finding = """
+Configuration is re-sampled on every cycle START is high, not only at launch: with START held, a
+CONFIG write during a run changes N under the running engine. In the counterexample a first run
+with log2(N) = 0 finishes, the engine restarts because START is still high, CONFIG is rewritten to an
+illegal length, and DONE is raised at stage 0. Holds once software clears START after launch and
+programs a legal length (`c2_done_after_last_stage`).
+"""
+
+[[property]]
+id = "c2_done_after_last_stage"
+claim = "C2"
+text = "DONE is reported only after every stage of the programmed length has run."
+assumptions = ["start_once", "legal_len"]
+
+[[property]]
+id = "c2_done_single_cycle"
+claim = "C2"
+text = "DONE is a single-cycle event."
+
+# ---------------------------------------------------------------- C3 completion
+[[property]]
+id = "c3_completes_within_bound"
+claim = "C3"
+text = "Once START is released, a run of a legal length ends within 5300 cycles."
+expect = "undecided"
+timeout_s = 1800
+assumptions = ["start_once", "legal_len"]
+
+# ---------------------------------------------------------------- C4 addressing
+[[property]]
+id = "c4_write_addr_in_range"
+claim = "C4"
+text = "Every data write lands inside the configured N-point buffer."
+assumptions = ["start_once", "legal_len"]
+expect = "fails"
+finding = """
+Result writes share one registered SRAM address with three reads (next butterfly A, operand B,
+twiddle), and the write has the lowest priority in that mux while its strobe is raised on
+pipeline_valid[4] alone. A result therefore goes out with whichever read address won that cycle —
+in a counterexample, the twiddle-read address 0x1000, i.e. into the twiddle bank. Neither CTRL.reset
+nor the block reset flushes the pipeline (pipeline_valid and the pipeline address/data registers have
+no reset), so in-flight writes go out after the engine is idle or after reset is released.
+"""
+
+[[property]]
+id = "c4_writeback_in_place"
+claim = "C4"
+text = "Butterfly results are written back in place, to the address the butterfly read."
+assumptions = ["start_once", "legal_len"]
+expect = "fails"
+finding = """
+Result writes share one registered SRAM address with three reads (next butterfly A, operand B,
+twiddle), and the write has the lowest priority in that mux while its strobe is raised on
+pipeline_valid[4] alone. A result therefore goes out with whichever read address won that cycle —
+in a counterexample, the twiddle-read address 0x1000, i.e. into the twiddle bank. Neither CTRL.reset
+nor the block reset flushes the pipeline (pipeline_valid and the pipeline address/data registers have
+no reset), so in-flight writes go out after the engine is idle or after reset is released.
+"""
+
+[[property]]
+id = "c4_no_data_write_to_twiddle_bank"
+claim = "C4"
+text = "Engine data writes never land in the twiddle bank."
+assumptions = ["start_once", "legal_len"]
+expect = "fails"
+finding = """
+Result writes share one registered SRAM address with three reads (next butterfly A, operand B,
+twiddle), and the write has the lowest priority in that mux while its strobe is raised on
+pipeline_valid[4] alone. A result therefore goes out with whichever read address won that cycle —
+in a counterexample, the twiddle-read address 0x1000, i.e. into the twiddle bank. Neither CTRL.reset
+nor the block reset flushes the pipeline (pipeline_valid and the pipeline address/data registers have
+no reset), so in-flight writes go out after the engine is idle or after reset is released.
+"""
+
+[[property]]
+id = "c4_writeback_in_place_no_abort"
+claim = "C4"
+text = "Butterfly results are written back in place (runs are never aborted)."
+assumptions = ["start_once", "legal_len", "no_abort"]
+expect = "fails"
+finding = """
+Not an abort artefact: in an uninterrupted run of a legal length (N = 256 in the counterexample,
+no reset of any kind after launch) every result write goes out with the current read address, and
+that address, addr_a = stage * 2^stage + butterfly, is not a radix-2 butterfly index — it passes N
+at stage 5. When DONE is raised the pipeline is still draining, so writes continue while the engine
+is idle and reach the twiddle region (0x1800).
+"""
+
+[[property]]
+id = "c4_write_addr_in_range_no_abort"
+claim = "C4"
+text = "Every data write lands inside the configured N-point buffer (runs are never aborted)."
+assumptions = ["start_once", "legal_len", "no_abort"]
+expect = "fails"
+finding = """
+Not an abort artefact: in an uninterrupted run of a legal length (N = 256 in the counterexample,
+no reset of any kind after launch) every result write goes out with the current read address, and
+that address, addr_a = stage * 2^stage + butterfly, is not a radix-2 butterfly index — it passes N
+at stage 5. When DONE is raised the pipeline is still draining, so writes continue while the engine
+is idle and reach the twiddle region (0x1800).
+"""
+
+[[property]]
+id = "c4_no_data_write_to_twiddle_bank_no_abort"
+claim = "C4"
+text = "Engine data writes never land in the twiddle bank (runs are never aborted)."
+assumptions = ["start_once", "legal_len", "no_abort"]
+expect = "fails"
+finding = """
+Not an abort artefact: in an uninterrupted run of a legal length (N = 256 in the counterexample,
+no reset of any kind after launch) every result write goes out with the current read address, and
+that address, addr_a = stage * 2^stage + butterfly, is not a radix-2 butterfly index — it passes N
+at stage 5. When DONE is raised the pipeline is still draining, so writes continue while the engine
+is idle and reach the twiddle region (0x1800).
+"""
+
+# ---------------------------------------------------------------- C5 scaling
+[[property]]
+id = "c5_scale_factor_no_wrap"
+claim = "C5"
+text = "The accumulated scale factor never wraps past 255."
+assumptions = ["start_once", "legal_len"]
+bound = 600   # the wrap needs 256 overflowing butterflies; a counterexample inside the bound is a full refutation
+expect = "fails"
+finding = """
+The scale factor is incremented once per overflowing butterfly, not once per stage, in an 8-bit
+register: with SRAM data free it wraps after 256 overflowing butterflies, so the exponent software reads back is wrong for any block with frequent overflow.
+"""
+
+# ---------------------------------------------------------------- C6 bus and interrupts
+[[property]]
+id = "c6_ctrl_written_only_by_apb"
+claim = "C6"
+text = "The control register changes only on a completed APB write to its address."
+
+[[property]]
+id = "c6_done_sets_int_status"
+claim = "C6"
+text = "An enabled DONE event is visible in INT_STATUS[0] on the next cycle."
+
+[[property]]
+id = "c6_int_status_held"
+claim = "C6"
+text = "Once set, INT_STATUS[0] stays set for at least two cycles."
+expect = "fails"
+finding = """
+Each pending bit clears itself the cycle after it is set (its clear term is the pending bit itself),
+so INT_STATUS[0] is a one-cycle pulse. A software read of INT_STATUS almost always misses it, and
+there is no write-1-to-clear path.
+"""
+
+[[property]]
+id = "c6_tl_no_unsolicited_response"
+claim = "C6"
+text = "TL-UL: no D-channel response without an outstanding request."
+
+[[property]]
+id = "c6_tl_single_outstanding"
+claim = "C6"
+text = "TL-UL: at most one request outstanding."
+
+[[property]]
+id = "c6_tl_response_matches_request"
+claim = "C6"
+text = "TL-UL: response opcode (AccessAck / AccessAckData), source and size match the request."
+
+[[property]]
+id = "c6_tl_d_stable"
+claim = "C6"
+text = "TL-UL: the D channel holds steady while valid and not yet accepted."
+
+[[property]]
+id = "c6_apb_access_after_setup"
+claim = "C6"
+text = "APB: every access phase follows a setup phase."
+
+[[property]]
+id = "c6_apb_stable"
+claim = "C6"
+text = "APB: address, direction and write data are stable for the whole transfer."
+
+# ---------------------------------------------------------------- covers
+[[cover]]
+id = "cov_done_any"
+text = "A run completes (any programmed length)."
+bound = 80
+
+[[cover]]
+id = "cov_done_legal"
+text = "A run of a legal length completes under the software assumptions."
+assumptions = ["start_once", "legal_len"]
+bound = 1400
+timeout_s = 3600
+
+[[cover]]
+id = "cov_done_legal_no_abort"
+text = "A run of a legal length completes with no abort."
+assumptions = ["start_once", "legal_len", "no_abort"]
+bound = 1400
+timeout_s = 7200
+expect = "undecided"   # ~1,300 cycles deep: reached once, then not within 1 h or 2 h; completion is shown by the golden-model regression
+
+[[cover]]
+id = "cov_error"
+text = "The engine reports an error."
+expect = "unreachable"
+finding = """
+Dead logic: the RUN -> ERROR transition is guarded by fft_error_o, which is itself decoded from the
+ERROR state, so the engine can never enter ERROR. FFT_STATUS.error and the fft_error_o interrupt are
+constant 0 — proved for every input sequence.
+"""
+
+[[cover]]
+id = "cov_rescale"
+text = "Rescaling becomes active."
+bound = 80
+
+[[cover]]
+id = "cov_twiddle_load"
+text = "Software loads a twiddle word over APB."
+bound = 40
+
+[[cover]]
+id = "cov_tl_write_ack"
+text = "A TL-UL write is acknowledged."
+bound = 40
+
+[[cover]]
+id = "cov_tl_read_data"
+text = "A TL-UL read returns data."
+bound = 40
+
+# ---------------------------------------------------------------- mutants
+[[mutant]]
+id = "mu_engine_reset_state"
+module = "fft_engine"
+text = "engine state resets to 1 instead of IDLE"
+find = "if \\(!reset_n_i\\)\\n\\t\\t\\tfft_state <= 3'd0;"
+replace = "if (!reset_n_i)\\n\\t\\t\\tfft_state <= 3'd1;"
+
+[[mutant]]
+id = "mu_done_after_one_stage"
+module = "fft_engine"
+text = "the run ends after the first stage"
+find = "3'd3:\\n\\t\\t\\t\\tif \\(stage_counter >= fft_length_log2_reg\\) begin"
+replace = "3'd3:\\n\\t\\t\\t\\tif (stage_counter >= 12'd1) begin"
+
+[[mutant]]
+id = "mu_done_held"
+module = "fft_engine"
+text = "DONE state does not return to IDLE"
+find = "3'd5: fft_next_state = 3'd0;"
+replace = "3'd5: fft_next_state = (fft_start_i ? 3'd0 : 3'd5);"
+
+[[mutant]]
+id = "mu_length_reset"
+module = "memory_interface"
+text = "LENGTH register resets to 0x200"
+find = "fft_length_reg <= 32'h00000400;"
+replace = "fft_length_reg <= 32'h00000200;"
+
+[[mutant]]
+id = "mu_ctrl_write_any_phase"
+module = "memory_interface"
+text = "register writes accepted outside the APB access phase"
+find = "else if \\(\\(apb_state == 2'd2\\) && pwrite_i\\)\\n\\t\\t\\tcase"
+replace = "else if (pwrite_i)\\n\\t\\t\\tcase"
+
+[[mutant]]
+id = "mu_int_status_lost"
+module = "fft_control"
+text = "done pending ignores the enable and clears on its own"
+find = "if \\(fft_done_i && int_enable_i\\[0\\]\\)\\n\\t\\t\\t\\tfft_done_pending <= 1'b1;"
+replace = "if (fft_done_i && int_enable_i[0] && fft_done_pending)\\n\\t\\t\\t\\tfft_done_pending <= 1'b1;"
+
+[[mutant]]
+id = "mu_tl_drop_response"
+module = "tlul_apb_adapter"
+text = "response retired without D-channel ready"
+find = "2'd3:\\n\\t\\t\\t\\tif \\(tl_d_ready_i\\)\\n\\t\\t\\t\\t\\tstate_d = 2'd0;"
+replace = "2'd3:\\n\\t\\t\\t\\tstate_d = 2'd0;"
+
+[[mutant]]
+id = "mu_tl_wrong_opcode"
+module = "tlul_apb_adapter"
+text = "write and read response opcodes swapped"
+find = "\\(req_write_q \\? TL_D_ACCESSACK : TL_D_ACCESSACKDATA\\)"
+replace = "(req_write_q ? TL_D_ACCESSACKDATA : TL_D_ACCESSACK)"
+
+[[mutant]]
+id = "mu_tl_ready_while_busy"
+module = "tlul_apb_adapter"
+text = "bridge accepts a request while one is outstanding"
+find = "assign tl_a_ready_o = state_q == 2'd0;"
+replace = "assign tl_a_ready_o = (state_q == 2'd0) | (state_q == 2'd3);"
+
+[[mutant]]
+id = "mu_apb_skip_setup"
+module = "tlul_apb_adapter"
+text = "APB access phase without a setup phase"
+find = "if \\(tl_a_valid_i\\)\\n\\t\\t\\t\\t\\tstate_d = 2'd1;"
+replace = "if (tl_a_valid_i)\\n\\t\\t\\t\\t\\tstate_d = 2'd2;"

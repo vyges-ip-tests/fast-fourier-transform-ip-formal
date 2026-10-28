@@ -1,0 +1,310 @@
+# vyges formal campaign: the FFT IP itself, after the fixes, in the Edge Sensor SoC configuration.
+# Design under proof = RTL only. The same claim families as the edge-sensor campaign (../manifest.toml),
+# restated against the fixed engine; the claims that failed there must hold here.
+
+[ip]
+name = "fft-ip-fixed"
+description = "FFT accelerator (fast-fourier-transform-ip) after the fixes: 1024-point build, 16-bit fixed point, APB on the core clock, two 1024x32 SRAM banks outside the block (FFT_USE_SRAM_MACRO)."
+scope_notes = """
+Configuration: FFT_MAX_LENGTH_LOG2 = 10, data and twiddle width 16, FFT_USE_SRAM_MACRO with the SoC's
+two-bank SRAM bridge (models/fft_data_sram.v), APB on the core clock and reset, AXI port tied off
+(models/fft_formal_top.v). APB inputs and SRAM read data are unconstrained: every claim here is a
+control, address, status or interrupt claim that must hold for any bus activity and any data. The
+TL-UL bridge of the SoC campaign is not part of the IP and is not under proof here. End-to-end
+numerical correctness is covered by the IP's golden-model regression, not by these proofs.
+"""
+
+[rtl]
+repo = "../../fast-fourier-transform-ip"   # clone it beside this repository, at the commit in report/
+frontend = "sv2v"
+include_dirs = ["rtl"]
+defines = ["FFT_USE_SRAM_MACRO"]
+files = [
+  "rtl/fft_fft_top.sv",
+  "rtl/fft_fft_engine.sv",
+  "rtl/fft_fft_control.sv",
+  "rtl/fft_memory_interface.sv",
+  "../fast-fourier-transform-ip-formal/fixed-ip/models/fft_data_sram.v",
+  "../fast-fourier-transform-ip-formal/fixed-ip/models/fft_formal_top.v",
+]
+extract_top = true
+top = "fft_formal_top"
+clock = "clk_i"
+
+[synth]
+# override with --liberty or VYGES_FORMAL_LIBERTY
+liberty = "${PDK_ROOT}/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+
+[defaults]
+timeout_s = 1800
+
+[[bind]]
+module = "fft_engine"
+file = "monitors/mon_engine.v"
+clock = "clk_i"
+reset = "reset_n_i"
+
+[[bind]]
+module = "memory_interface"
+file = "monitors/mon_memif.v"
+clock = "clk_i"
+reset = "reset_n_i"
+
+[[bind]]
+module = "fft_control"
+file = "monitors/mon_control.v"
+clock = "clk_i"
+reset = "reset_n_i"
+
+[[assumption]]
+id = "start_once"
+text = "Software may hold START high from launch, but once START is low during a run it is not raised again until the engine is idle."
+
+[[assumption]]
+id = "apb_master"
+text = "The APB master follows the protocol: once PSEL and PENABLE are high it holds them, with PADDR, PWRITE and PWDATA, until PREADY."
+
+[[assumption]]
+id = "legal_len"
+text = "Whenever START is high, the programmed length is legal for this build: log2(N) in 8..10 (256..1024 points)."
+
+# ---------------------------------------------------------------- C1 reset
+[[property]]
+id = "c1_engine_reset_state"
+claim = "C1"
+text = "On the first cycle after reset, the engine is idle with counters, write strobe and scale factor clear."
+
+[[property]]
+id = "c1_regs_reset_values"
+claim = "C1"
+text = "On the first cycle after reset, CTRL, CONFIG and INT_ENABLE are 0, LENGTH is 0x400, and PREADY is low."
+
+[[property]]
+id = "c1_int_status_reset"
+claim = "C1"
+text = "On the first cycle after reset, interrupt status is clear."
+
+# ---------------------------------------------------------------- C2 done
+[[property]]
+id = "c2_done_after_last_stage_raw"
+claim = "C2"
+text = "DONE is reported only after every stage of the length latched at launch has run (no software assumption). Proved through the stage-bookkeeping invariant in monitors/mon_engine.v."
+
+[[property]]
+id = "c2_done_single_cycle"
+claim = "C2"
+text = "DONE is a single-cycle event."
+
+[[property]]
+id = "c2_config_latched"
+claim = "C2"
+text = "The length a run uses does not change while the run is in progress, whatever software writes."
+
+[[property]]
+id = "c2_done_after_reorder"
+claim = "C2"
+text = "DONE is reported only after the bit-reverse pass has reached the last word."
+
+# ---------------------------------------------------------------- C3 completion
+[[property]]
+id = "c3_completes_within_bound"
+claim = "C3"
+text = "Once START is released, a run of a legal length ends within 35000 cycles."
+assumptions = ["start_once", "legal_len"]
+expect = "undecided"   # tens of thousands of cycles deep; legal-length completion is shown by the golden-model regression
+
+# ---------------------------------------------------------------- C4 addressing
+[[property]]
+id = "c4_write_addr_in_range"
+claim = "C4"
+text = "Every data write lands inside the configured N-point buffer (no software assumption)."
+
+[[property]]
+id = "c4_writeback_in_place"
+claim = "C4"
+text = "Results are written back in place: each pair of writes goes to the two data words just read, in order."
+
+[[property]]
+id = "c4_no_data_write_to_twiddle_bank"
+claim = "C4"
+text = "Engine data writes never land in the twiddle bank."
+
+[[property]]
+id = "c4_write_only_during_run"
+claim = "C4"
+text = "The engine writes memory only while computing or reordering; never when idle, done or after an abort."
+
+[[property]]
+id = "c4_no_write_after_abort"
+claim = "C4"
+text = "The cycle after CTRL.reset, no write is issued."
+
+# ---------------------------------------------------------------- C5 scaling
+[[property]]
+id = "c5_scale_factor_no_wrap"
+claim = "C5"
+text = "The accumulated scale factor never exceeds log2(N), so it never wraps. Proved through the stage-bookkeeping invariant in monitors/mon_engine.v."
+
+# ---------------------------------------------------------------- C6 status and interrupts
+[[property]]
+id = "c6_ctrl_written_only_by_apb"
+claim = "C6"
+text = "The control register changes only on a completed APB write to its address."
+assumptions = ["apb_master"]
+
+[[property]]
+id = "c6_done_sets_int_status"
+claim = "C6"
+text = "An enabled DONE event is visible in INT_STATUS[0] on the next cycle."
+
+[[property]]
+id = "c6_int_status_held"
+claim = "C6"
+text = "Once set, INT_STATUS[0] stays set until software writes 1 to it."
+
+[[property]]
+id = "c6_int_status_set_only_when_enabled"
+claim = "C6"
+text = "INT_STATUS[0] is set only while its interrupt is enabled."
+
+[[property]]
+id = "c6_status_done_held"
+claim = "C6"
+text = "Once set, FFT_STATUS.done stays set until the next run starts."
+
+# ---------------------------------------------------------------- covers
+[[cover]]
+id = "cov_done_any"
+text = "A run completes (any accepted length)."
+bound = 60
+
+[[cover]]
+id = "cov_done_legal"
+text = "A run of a legal length (256 points or more) completes under the software assumptions."
+assumptions = ["start_once", "legal_len"]
+bound = 7100
+expect = "undecided"   # a 256-point run is ~7,600 cycles deep; shown instead by the golden-model regression
+
+[[cover]]
+id = "cov_error"
+text = "The engine reports an error (a rejected length)."
+bound = 40
+
+[[cover]]
+id = "cov_rescale"
+text = "A scaled stage is computed."
+bound = 60
+
+[[cover]]
+id = "cov_reorder_swap"
+text = "The bit-reverse pass swaps a pair of words."
+bound = 80
+
+[[cover]]
+id = "cov_twiddle_load"
+text = "Software loads a twiddle word over APB."
+bound = 40
+
+[[cover]]
+id = "cov_int_cleared"
+text = "Software clears a pending INT_STATUS[0] by writing 1."
+bound = 80
+
+# ---------------------------------------------------------------- mutants
+[[mutant]]
+id = "mu_engine_reset_state"
+module = "fft_engine"
+find = "fft_state <= 3'd0;(\\s+)fft_length_log2_reg <= 12'h00a;"
+replace = "fft_state <= 3'd1;\\1fft_length_log2_reg <= 12'h00a;"
+text = "engine state resets to CONFIG instead of IDLE"
+
+[[mutant]]
+id = "mu_length_reset"
+module = "memory_interface"
+find = "fft_length_reg <= 32'h00000400;"
+replace = "fft_length_reg <= 32'h00000200;"
+text = "LENGTH register resets to 0x200"
+
+[[mutant]]
+id = "mu_config_resampled"
+module = "fft_engine"
+find = "mem_write_i <= 1'b0;(\\s+)case \\(fft_state\\)"
+replace = "mem_write_i <= 1'b0;\\1if (fft_start_i) fft_length_log2_reg <= fft_length_log2_i;\\1case (fft_state)"
+text = "the length is re-sampled whenever START is high, as before the fix"
+
+[[mutant]]
+id = "mu_done_one_stage_early"
+module = "fft_engine"
+find = "assign last_stage = stage_counter == \\(length_log2 - 4'd1\\);"
+replace = "assign last_stage = stage_counter == (length_log2 - 4'd2);"
+text = "the last stage is skipped"
+
+[[mutant]]
+id = "mu_skip_reorder"
+module = "fft_engine"
+find = "fft_state <= 3'd5;"
+replace = "fft_state <= 3'd6;"
+text = "DONE without the bit-reverse pass"
+
+[[mutant]]
+id = "mu_accept_any_length"
+module = "fft_engine"
+find = "fft_state <= 3'd7;"
+replace = "fft_state <= 3'd2;"
+text = "illegal lengths are accepted instead of rejected"
+
+[[mutant]]
+id = "mu_write_a_to_b"
+module = "fft_engine"
+find = "mem_addr_i <= sv2v_cast_16\\(addr_a\\);(\\s+)mem_data_i <= \\{out_a_im"
+replace = "mem_addr_i <= sv2v_cast_16(addr_b);\\1mem_data_i <= {out_a_im"
+text = "the first butterfly result is written to B's address"
+
+[[mutant]]
+id = "mu_write_into_twiddles"
+module = "fft_engine"
+find = "mem_addr_i <= sv2v_cast_16\\(addr_b\\);(\\s+)mem_data_i <= result_b;"
+replace = "mem_addr_i <= FFT_TWIDDLE_BASE + sv2v_cast_16(addr_b);\\1mem_data_i <= result_b;"
+text = "the second butterfly result is written into the twiddle bank"
+
+[[mutant]]
+id = "mu_abort_keeps_write"
+module = "fft_engine"
+find = "else if \\(fft_reset_i\\) begin(\\s+)fft_state <= 3'd0;(\\s+)phase <= 1'sb0;(\\s+)mem_addr_i <= 1'sb0;(\\s+)mem_write_i <= 1'b0;"
+replace = "else if (fft_reset_i) begin\\1fft_state <= 3'd0;\\2phase <= 1'sb0;\\3mem_addr_i <= 1'sb0;"
+text = "CTRL.reset leaves an in-flight write strobe set"
+
+[[mutant]]
+id = "mu_scale_per_butterfly"
+module = "fft_engine"
+find = "mem_data_i <= result_b;(\\s+)mem_write_i <= 1'b1;"
+replace = "mem_data_i <= result_b;\\1mem_write_i <= 1'b1;\\1if (stage_scaled) scale_factor_reg <= scale_factor_reg + 8'd1;"
+text = "the scale factor counts scaled butterflies instead of scaled stages, as before the fix"
+
+[[mutant]]
+id = "mu_int_status_self_clears"
+module = "fft_control"
+find = "\\(fft_done_pending & ~int_status_clear_i\\[0\\]\\)"
+replace = "(fft_done_pending & ~fft_done_pending)"
+text = "the done pending bit clears itself, as before the fix"
+
+[[mutant]]
+id = "mu_int_ignores_enable"
+module = "fft_control"
+find = "\\(int_rise\\[0\\] & int_enable_i\\[0\\]\\)"
+replace = "int_rise[0]"
+text = "the done pending bit is set even when its interrupt is disabled"
+
+[[mutant]]
+id = "mu_status_done_pulse"
+module = "memory_interface"
+find = "status_done_q <= fft_done_i \\| \\(status_done_q & ~fft_busy_i\\);"
+replace = "status_done_q <= fft_done_i;"
+text = "FFT_STATUS.done is a one-cycle pulse, as before the fix"
+
+[[mutant]]
+id = "mu_ctrl_write_any_phase"
+module = "memory_interface"
+find = "else if \\(\\(apb_state == 2'd2\\) && pwrite_i\\)"
+replace = "else if (pwrite_i)"
+text = "register writes accepted outside the APB access phase"

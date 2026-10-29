@@ -146,8 +146,9 @@ And within these limits:
   the report's lint section) are an assumption in the model, not a proof.
 - The bounded-completion claim (C3: a legal run ends within 5300 cycles) is undecided at its
   30-minute limit and is reported as such, never as a pass. So is the cover for a legal run that
-  completes without an abort, about 1,300 cycles deep: it was reached once, then not within one or
-  two hours. For the fixed IP, completion of legal runs is shown by its bit-exact golden-model
+  completes without an abort, also at a 30-minute limit: it is about 1,050 cycles deep and has been
+  reached, but only after well over an hour, so a limit near that time would make the result depend
+  on the machine. For the fixed IP, completion of legal runs is shown by its bit-exact golden-model
   regression instead.
 - The results are for this RTL commit and configuration, and say nothing about timing closure.
 

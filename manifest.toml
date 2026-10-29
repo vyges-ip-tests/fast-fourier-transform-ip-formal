@@ -282,15 +282,15 @@ id = "cov_done_legal"
 text = "A run of a legal length completes under the software assumptions."
 assumptions = ["start_once", "legal_len"]
 bound = 1400
-timeout_s = 3600
+timeout_s = 7200   # reached in ~40 min; the budget leaves room for a slower machine
 
 [[cover]]
 id = "cov_done_legal_no_abort"
 text = "A run of a legal length completes with no abort."
 assumptions = ["start_once", "legal_len", "no_abort"]
 bound = 1400
-timeout_s = 7200
-expect = "undecided"   # ~1,300 cycles deep: reached once, then not within 1 h or 2 h; completion is shown by the golden-model regression
+timeout_s = 1800
+expect = "undecided"   # ~1,050 cycles deep and reached only after ~100 min, so the outcome near a 2 h budget depends on the machine; a 30 min budget keeps it undecided with a wide margin. Completion is shown by the golden-model regression
 
 [[cover]]
 id = "cov_error"
